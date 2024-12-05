@@ -1,0 +1,45 @@
+{
+  "name": "fe-demo__xstate--react-vite-ts",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "biome lint .",
+    "format": "biome format . --write",
+    "preview": "vite preview",
+    "start:db": "json-server ./db/index.json",
+    "storybook": "storybook dev -p 6006",
+    "build-storybook": "storybook build"
+  },
+  "dependencies": {
+    "@xstate/react": "^5.0.0",
+    "json-server": "^1.0.0-beta.3",
+    "loglevel": "^1.9.2",
+    "react": "^18.3.1",
+    "react-aria-components": "^1.5.0",
+    "react-dom": "^18.3.1",
+    "reselect": "^5.1.1",
+    "xstate": "^5.19.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "1.5.3",
+    "@chromatic-com/storybook": "^3.2.2",
+    "@storybook/addon-essentials": "^8.4.6",
+    "@storybook/addon-interactions": "^8.4.6",
+    "@storybook/addon-onboarding": "^8.4.6",
+    "@storybook/blocks": "^8.4.6",
+    "@storybook/react": "^8.4.6",
+    "@storybook/react-vite": "^8.4.6",
+    "@storybook/test": "^8.4.6",
+    "@types/node": "^22.10.1",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react-swc": "^3.7.2",
+    "storybook": "^8.4.6",
+    "typescript": "~5.6.2",
+    "vite": "^6.0.1"
+  }
+}
