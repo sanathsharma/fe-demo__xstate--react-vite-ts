@@ -1,51 +1,70 @@
 import log from "loglevel";
 import {
-  assertEvent,
   assign,
   type DoneActorEvent,
   type ErrorActorEvent,
-  fromPromise,
   not,
   setup,
-  type DoneStateEvent,
+  type PromiseActorLogic,
+  type ActorRefFromLogic,
+  type AnyActorLogic,
+  assertEvent,
+  stopChild,
 } from "xstate";
 
-type Options = {
-  retryEnabled: boolean;
-  retryCount: number;
-  retryDelay: number;
+type PartialOptions = {
+  retryEnabled?: boolean;
+  retryCount?: number;
+  retryDelay?: number;
 };
-type Meta<TPayload = unknown> = { retryAttempts: number; payload?: TPayload; options: Options };
+
+type Options<TData, TPayload, TError> = PartialOptions & {
+  promise: PromiseActorLogic<TData, TPayload, MachineEvents<TData, TError, TPayload>>;
+  onSuccess?: (data: TData, payload: TPayload) => void;
+  onError?: (error: TError, payload: TPayload) => void;
+};
+type Meta<TPayload = unknown> = { retryAttempts: number; payload?: TPayload; options: Required<PartialOptions> };
 
 type MachineContext<TData, TError = Error, TPayload = unknown> = {
   response?: TData;
   error?: TError;
   _meta: Meta<TPayload>;
+  childRef?: ActorRefFromLogic<AnyActorLogic>;
 };
 
 export type MachineEvents<TData, TError = Error, TPayload = unknown> =
   | { type: "FETCH"; payload: TPayload }
+  | { type: "FETCH_BG"; payload: TPayload }
   | { type: "UPDATE"; update: (prev: TData) => TData }
   | { type: "REJECT" }
   | { type: "RESOLVE" }
   | DoneActorEvent<TData, "promise">
   | ErrorActorEvent<TError, "promise">;
 
-export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(id: string, options?: Options) => {
+export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(
+  id: string,
+  options: Options<TData, TPayload, TError>
+) => {
   type Events = MachineEvents<TData, TError, TPayload>;
   type Context = MachineContext<TData, TError, TPayload>;
 
-  const initialOptions: Options = Object.assign({}, { retryCount: 3, retryEnabled: false, retryDelay: 1000 }, options);
+  const { promise, onSuccess, onError, ...partialOptions } = options;
+
+  const initialOptions: Required<PartialOptions> = Object.assign(
+    {},
+    { retryCount: 3, retryEnabled: false, retryDelay: 1000 },
+    partialOptions
+  );
+
   const initialMeta: Meta<TPayload> = { retryAttempts: 0, payload: undefined, options: initialOptions };
 
-  return setup({
+  const pendingMachine = setup({
     types: {
       context: {} as Context,
-      events: {} as Events,
+      input: {} as TPayload,
+      output: {} as Pick<Context, "response" | "error">,
     },
     actions: {
-      onSuccess: (_, params: TData) => log.debug("onSuccess", params),
-      onError: (_, params: TError) => log.error("onError", params),
       updateRetryAttepmts: ({ context }) => {
         return {
           ...context,
@@ -54,10 +73,7 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(id
       },
     },
     actors: {
-      promise: fromPromise<TData, TPayload, Events>(async ({ input }): Promise<TData> => {
-        log.debug("promise", input);
-        return Promise.resolve({} as TData);
-      }),
+      promise,
     },
     delays: {
       retryDelay: ({ context }) => {
@@ -74,6 +90,85 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(id
       },
     },
   }).createMachine({
+    id: "pendingMachine",
+    initial: "default",
+    context: ({ input }) => ({ response: undefined, error: undefined, _meta: { ...initialMeta, payload: input } }),
+    output: ({ context }) => {
+      return { response: context.response, error: context.error };
+    },
+    states: {
+      default: {
+        invoke: {
+          id: "promise",
+          src: "promise",
+          input: ({ context }) => {
+            return context._meta.payload;
+          },
+          onDone: {
+            target: "done",
+            actions: [
+              assign({
+                response: ({ event }) => {
+                  // assertEvent(event, "xstate.done.actor.promise");
+                  return event.output as TData;
+                },
+                error: undefined,
+              }),
+            ],
+          },
+          onError: [
+            {
+              target: "done",
+              guard: not("canAttemptRetry"),
+              actions: [
+                assign({
+                  response: undefined,
+                  error: ({ event }) => {
+                    // assertEvent(event, "xstate.error.actor.promise");
+                    return event.error as TError;
+                  },
+                }),
+              ],
+            },
+            {
+              guard: "canAttemptRetry",
+              target: "retry",
+            },
+          ],
+        },
+      },
+      retry: {
+        description: "Intermediate state to acheive delay in retry attemps",
+        after: {
+          retryDelay: {
+            target: "default",
+            actions: ["updateRetryAttepmts"],
+          },
+        },
+      },
+      done: {
+        type: "final",
+      },
+    },
+  });
+
+  return setup({
+    types: {
+      context: {} as Context,
+      events: {} as Events,
+    },
+    actions: {
+      onSuccess: (_, data: TData) => log.debug("success", data),
+      onError: (_, error) => log.debug("error", error),
+      updateData: assign(({ context, event }) => {
+        return {
+          ...context,
+          response: event.output.response,
+          error: event.output.error,
+        };
+      }),
+    },
+  }).createMachine({
     id: id,
     initial: "idle",
     context: { response: undefined, error: undefined, _meta: initialMeta },
@@ -81,7 +176,7 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(id
       idle: {
         on: {
           FETCH: {
-            target: "pending.default",
+            target: "pending",
             actions: assign({
               _meta: ({ event, context }) => {
                 return { ...context._meta, payload: event.payload };
@@ -91,97 +186,36 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(id
         },
       },
       pending: {
-        initial: "default",
-        states: {
-          default: {
-            invoke: {
-              id: "promise",
-              src: "promise",
-              input: ({ event }) => {
-                assertEvent(event, "FETCH");
-                return event.payload;
-              },
-              onDone: {
-                target: "done",
-                actions: [
-                  assign({
-                    response: ({ event }) => {
-                      // assertEvent(event, "xstate.done.actor.promise");
-                      return event.output as TData;
-                    },
-                    error: undefined,
-                  }),
-                  {
-                    type: "onSuccess",
-                    params: ({ event }) => event.output,
-                  },
-                ],
-              },
-              onError: [
-                {
-                  target: "error",
-                  guard: not("canAttemptRetry"),
-                  actions: [
-                    assign({
-                      response: undefined,
-                      error: ({ event }) => {
-                        // assertEvent(event, "xstate.error.actor.promise");
-                        return event.error as TError;
-                      },
-                    }),
-                    {
-                      type: "onError",
-                      params: ({ event }) => event.error,
-                    },
-                  ],
-                },
-                {
-                  guard: "canAttemptRetry",
-                  target: "retry",
-                },
-              ],
+        invoke: {
+          id: "pendingMachine",
+          src: pendingMachine,
+          input: ({ event }) => {
+            assertEvent(event, "FETCH");
+            return event.payload;
+          },
+          onDone: [
+            {
+              guard: ({ event }) => !!event.output.error,
+              target: "rejected",
+              actions: ["updateData"],
             },
-          },
-          retry: {
-            description: "Intermediate state to acheive delay in retry attemps",
-            after: {
-              retryDelay: {
-                target: "default",
-                actions: ["updateRetryAttepmts"],
-              },
+            {
+              target: "resolved",
+              guard: ({ event }) => !event.output.error,
+              actions: ["updateData"],
             },
-          },
-          done: {
-            type: "final",
-            output: { error: false },
-          },
-          error: {
-            type: "final",
-            output: { error: true },
-          },
+          ],
         },
-        onDone: [
-          {
-            guard: ({ event }) => {
-              assertEvent(event, `xstate.done.state.${id}.pending`);
-              const isError = (event as DoneStateEvent<{ error: boolean }>).output.error;
-              return !isError;
-            },
-            target: "resolved",
-          },
-          {
-            guard: ({ event }) => {
-              assertEvent(event, `xstate.done.state.${id}.pending`);
-              const isError = (event as DoneStateEvent<{ error: boolean }>).output.error;
-              return isError;
-            },
-            target: "rejected",
-          },
-        ],
       },
       resolved: {
+        entry: [
+          {
+            type: "onSuccess",
+            params: ({ context }) => context.response as TData,
+          },
+        ],
         on: {
-          FETCH: "pending.default",
+          FETCH: "pending",
           UPDATE: {
             actions: assign({
               response: ({ event, context }) => {
@@ -190,15 +224,44 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(id
               },
             }),
           },
+          FETCH_BG: {
+            actions: [assign({ childRef: ({ spawn }) => spawn(pendingMachine, { id: "pendingMachine" }) })],
+          },
+          RESOLVE: {
+            actions: [
+              assign(({ context, event }) => ({
+                ...context,
+                response: event.output.response,
+                error: event.output.error,
+                childRef: undefined,
+              })),
+              stopChild("pendingMachine"),
+            ],
+          },
+          REJECT: {
+            target: "rejected",
+            actions: [
+              assign(({ context, event }) => ({
+                ...context,
+                response: event.output.response,
+                error: event.output.error,
+                childRef: undefined,
+              })),
+              stopChild("pendingMachine"),
+            ],
+          },
         },
       },
       rejected: {
+        entry: [
+          {
+            type: "onError",
+            params: ({ context }) => context.error,
+          },
+        ],
         description: "After all the retry attemps (if enabled), if still error persists, this state is entered.",
         on: {
-          FETCH: {
-            target: "pending.default",
-            actions: ["updateRetryAttepmts"],
-          },
+          FETCH: "pending",
         },
       },
     },
