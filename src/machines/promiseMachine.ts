@@ -9,7 +9,6 @@ import {
   type ActorRefFromLogic,
   type AnyActorLogic,
   assertEvent,
-  stopChild,
 } from "xstate";
 
 type PartialOptions = {
@@ -20,8 +19,6 @@ type PartialOptions = {
 
 type Options<TData, TPayload, TError> = PartialOptions & {
   promise: PromiseActorLogic<TData, TPayload, MachineEvents<TData, TError, TPayload>>;
-  onSuccess?: (data: TData, payload: TPayload) => void;
-  onError?: (error: TError, payload: TPayload) => void;
 };
 type Meta<TPayload = unknown> = { retryAttempts: number; payload?: TPayload; options: Required<PartialOptions> };
 
@@ -34,7 +31,7 @@ type MachineContext<TData, TError = Error, TPayload = unknown> = {
 
 export type MachineEvents<TData, TError = Error, TPayload = unknown> =
   | { type: "FETCH"; payload: TPayload }
-  | { type: "FETCH_BG"; payload: TPayload }
+  | { type: "FETCH_BG"; payload?: Partial<TPayload> | ((payload: TPayload) => TPayload) }
   | { type: "UPDATE"; update: (prev: TData) => TData }
   | { type: "REJECT" }
   | { type: "RESOLVE" }
@@ -48,7 +45,7 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(
   type Events = MachineEvents<TData, TError, TPayload>;
   type Context = MachineContext<TData, TError, TPayload>;
 
-  const { promise, onSuccess, onError, ...partialOptions } = options;
+  const { promise, ...partialOptions } = options;
 
   const initialOptions: Required<PartialOptions> = Object.assign(
     {},
@@ -207,6 +204,29 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(
           ],
         },
       },
+      refetching: {
+        invoke: {
+          id: "pendingMachine",
+          src: pendingMachine,
+          input: ({ event, context }) => {
+            assertEvent(event, "FETCH_BG");
+            const _payload = typeof event.payload === "function" ? event.payload(context._meta.payload) : event.payload;
+            return Object.assign({}, context._meta.payload, _payload);
+          },
+          onDone: [
+            {
+              guard: ({ event }) => !!event.output.error,
+              target: "rejected",
+              actions: ["updateData"],
+            },
+            {
+              target: "resolved",
+              guard: ({ event }) => !event.output.error,
+              actions: ["updateData"],
+            },
+          ],
+        },
+      },
       resolved: {
         entry: [
           {
@@ -224,32 +244,7 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(
               },
             }),
           },
-          FETCH_BG: {
-            actions: [assign({ childRef: ({ spawn }) => spawn(pendingMachine, { id: "pendingMachine" }) })],
-          },
-          RESOLVE: {
-            actions: [
-              assign(({ context, event }) => ({
-                ...context,
-                response: event.output.response,
-                error: event.output.error,
-                childRef: undefined,
-              })),
-              stopChild("pendingMachine"),
-            ],
-          },
-          REJECT: {
-            target: "rejected",
-            actions: [
-              assign(({ context, event }) => ({
-                ...context,
-                response: event.output.response,
-                error: event.output.error,
-                childRef: undefined,
-              })),
-              stopChild("pendingMachine"),
-            ],
-          },
+          FETCH_BG: "refetching",
         },
       },
       rejected: {
