@@ -18,7 +18,7 @@ type PartialOptions = {
 };
 
 type Options<TData, TPayload, TError> = PartialOptions & {
-  promise: PromiseActorLogic<TData, TPayload, MachineEvents<TData, TError, TPayload>>;
+  promise: PromiseActorLogic<TData, { payload: TPayload }, MachineEvents<TData, TError, TPayload>>;
 };
 type Meta<TPayload = unknown> = { retryAttempts: number; payload?: TPayload; options: Required<PartialOptions> };
 
@@ -33,12 +33,11 @@ export type MachineEvents<TData, TError = Error, TPayload = unknown> =
   | { type: "FETCH"; payload: TPayload }
   | { type: "FETCH_BG"; payload?: Partial<TPayload> | ((payload: TPayload) => TPayload) }
   | { type: "UPDATE"; update: (prev: TData) => TData }
-  | { type: "REJECT" }
-  | { type: "RESOLVE" }
   | DoneActorEvent<TData, "promise">
+  | DoneActorEvent<{ response: TData; error: null } | { response: null; error: TError }, "pendingMachine">
   | ErrorActorEvent<TError, "promise">;
 
-export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(
+export const createPromiseMachine = <TData, TError = Error, TPayload = unknown>(
   id: string,
   options: Options<TData, TPayload, TError>
 ) => {
@@ -58,7 +57,7 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(
   const pendingMachine = setup({
     types: {
       context: {} as Context,
-      input: {} as TPayload,
+      input: {} as { payload: TPayload },
       output: {} as Pick<Context, "response" | "error">,
     },
     actions: {
@@ -89,7 +88,11 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(
   }).createMachine({
     id: "pendingMachine",
     initial: "default",
-    context: ({ input }) => ({ response: undefined, error: undefined, _meta: { ...initialMeta, payload: input } }),
+    context: ({ input }) => ({
+      response: undefined,
+      error: undefined,
+      _meta: { ...initialMeta, payload: input.payload },
+    }),
     output: ({ context }) => {
       return { response: context.response, error: context.error };
     },
@@ -99,7 +102,7 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(
           id: "promise",
           src: "promise",
           input: ({ context }) => {
-            return context._meta.payload;
+            return { payload: context._meta.payload as TPayload };
           },
           onDone: {
             target: "done",
@@ -154,18 +157,29 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(
       context: {} as Context,
       events: {} as Events,
     },
+    actors: { pendingMachine },
     actions: {
-      onSuccess: (_, data: TData) => log.debug("success", data),
-      onError: (_, error) => log.debug("error", error),
-      updateData: assign(({ context, event }) => {
-        return {
-          ...context,
-          response: event.output.response,
-          error: event.output.error,
-        };
+      onSuccess: (_, params: { data: TData; payload: TPayload }) => log.debug("success", params),
+      onError: (_, params: { error: TError; payload: TPayload }) => log.debug("error", params),
+      updateData: assign({
+        response: ({ event }) => {
+          assertEvent(event, "xstate.done.actor.pendingMachine");
+          return event.output.response as TData;
+        },
+        error: ({ event }) => {
+          assertEvent(event, "xstate.done.actor.pendingMachine");
+          return event.output.error as TError;
+        },
       }),
     },
+    guards: {
+      isError: ({ event }) => {
+        assertEvent(event, "xstate.done.actor.pendingMachine");
+        return !!event.output.error;
+      },
+    },
   }).createMachine({
+    /** @xstate-layout N4IgpgJg5mDOIC5QAoC2BDAxgCwJYDswBKAOlwgBswBiAMQFEAVAYQAkBtABgF1FQAHAPaxcAF1yD8fEAA9EATgDMikgCZ5ANgAcAdgCsAGhABPRABYAjCq1mNivZY1PnigL6ujaLHkKl+YfAgCKGoISTAyfAA3QQBrCP9A4IBZbwIwLl4kECERcUlpOQQLDRKSCz0NVUMTREUNThI9erM9LWUOxVUNd08MHHS-AKD8ELDCSJj4kkSRqFSBwnYLLIFhMQkpbKKlFXVtfSNTBFUdRsUlVXUS5yc3DxAvReISACcwADMwUUWx8Mm4glhik0kseNJchsCttzJw9CQzDZFIdaggtBYmr1Hv0fC93l8fj4-hMCFMgUlRgtcctVjl1vktqAimY4QikSjjl0VGdFBZqlinrjSO9YIIKFFIHQmGxMhD6ZtCgplGpNLoapy7CRFLZ7I5bnYBTjBm84GKJRBqABVAAKABEAIKMeiy7KQhmKhA6HSqEhaVTo6pHRBXFRmHQaSr8h6C40is2ShgsVgAfQAQgBxF1rPIKmEIPRKJpBk46PacXlRvqgvFgABWYEwogT0o44Nd8uhTMQFi0nB0JFLZmR6rqFka5Y0rXanS6PSx+EEEDg0hjvjlOc7sm7jVayP9FjO8j0bRsxYAtBoSJxr5xSsPqspWobq6RyFR11DGVu0beVQcRwgQ79n21z6i4z7PEMFJQB+7p5nyVQkBoOg9hydRmD6Nh2A4Ny3PcVaQSaBK-LBuZdvmWgIs03rooex5aKeqI9peuicLo049pwFhmGYEFCiaoripApGbkUg6+gWw7Fl0ZgIvsap8bGdYNk2EAiV+RQWPIqjnGhJylE0LRtDOs7uO4QA */
     id: id,
     initial: "idle",
     context: { response: undefined, error: undefined, _meta: initialMeta },
@@ -185,20 +199,20 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(
       pending: {
         invoke: {
           id: "pendingMachine",
-          src: pendingMachine,
+          src: "pendingMachine",
           input: ({ event }) => {
             assertEvent(event, "FETCH");
-            return event.payload;
+            return { payload: event.payload };
           },
           onDone: [
             {
-              guard: ({ event }) => !!event.output.error,
+              guard: "isError",
               target: "rejected",
               actions: ["updateData"],
             },
             {
               target: "resolved",
-              guard: ({ event }) => !event.output.error,
+              guard: not("isError"),
               actions: ["updateData"],
             },
           ],
@@ -207,21 +221,22 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(
       refetching: {
         invoke: {
           id: "pendingMachine",
-          src: pendingMachine,
+          src: "pendingMachine",
           input: ({ event, context }) => {
             assertEvent(event, "FETCH_BG");
-            const _payload = typeof event.payload === "function" ? event.payload(context._meta.payload) : event.payload;
-            return Object.assign({}, context._meta.payload, _payload);
+            const _payload =
+              typeof event.payload === "function" ? event.payload(context._meta.payload as TPayload) : event.payload;
+            return { payload: Object.assign({}, context._meta.payload, _payload) };
           },
           onDone: [
             {
-              guard: ({ event }) => !!event.output.error,
+              guard: "isError",
               target: "rejected",
               actions: ["updateData"],
             },
             {
               target: "resolved",
-              guard: ({ event }) => !event.output.error,
+              guard: not("isError"),
               actions: ["updateData"],
             },
           ],
@@ -231,7 +246,7 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(
         entry: [
           {
             type: "onSuccess",
-            params: ({ context }) => context.response as TData,
+            params: ({ context }) => ({ data: context.response as TData, payload: context._meta.payload as TPayload }),
           },
         ],
         on: {
@@ -251,7 +266,7 @@ export const createFetchMachine = <TData, TError = Error, TPayload = unknown>(
         entry: [
           {
             type: "onError",
-            params: ({ context }) => context.error,
+            params: ({ context }) => ({ error: context.error as TError, payload: context._meta.payload as TPayload }),
           },
         ],
         description: "After all the retry attemps (if enabled), if still error persists, this state is entered.",
